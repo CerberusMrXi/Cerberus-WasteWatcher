@@ -1,5 +1,28 @@
 <div align="center">
 
+<img src="https://img.shields.io/badge/🚧%20PROJECT%20STATUS-UNDER%20MAINTENANCE-orange?style=for-the-badge" alt="Under Maintenance">
+
+<br>
+
+<h2>🚧 Project Under Maintenance 🚧</h2>
+
+<p>
+This project is currently undergoing major improvements, bug fixes, performance optimizations,
+and feature enhancements.
+</p>
+
+<p>
+⚠️ Some features may be unstable or temporarily unavailable.
+</p>
+
+<p>
+Thank you for your patience and support.
+</p>
+
+</div>
+
+<div align="center">
+
 <img src="https://capsule-render.vercel.app/api?type=waving&color=0:0d1117,50:1a1a2e,100:16213e&height=200&section=header&text=CERBERUS%20WASTEWATCHER&fontSize=42&fontColor=FFD700&fontAlignY=38&desc=Industry-Level%20AI%20Garbage%20and%20People%20Detection%20System&descColor=00FF88&descAlignY=58&descSize=16" width="100%"/>
 
 <br/>
