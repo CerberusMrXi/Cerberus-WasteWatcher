@@ -1,5 +1,744 @@
 #!/usr/bin/env python3
 """
+Cerberus WasteWatcher — Industry Edition
+Version: 1.0.0
+Author - Sudeepa Wanigarathna
+Fixes: Person detection filter, COCO-class garbage IDs, IoU tracker,
+       temporal carry logic, on_drop NameError, requirements cleanup.
+"""
+
+import cv2
+import numpy as np
+from ultralytics import YOLO
+import time
+import os
+import csv
+from datetime import datetime
+from pathlib import Path
+import hashlib
+from collections import defaultdict, deque
+import argparse
+import warnings
+warnings.filterwarnings('ignore')
+
+# ─────────────────────────────────────────────────────────────────────────────
+# BANNER
+# ─────────────────────────────────────────────────────────────────────────────
+def display_banner():
+    print("""
+╔══════════════════════════════════════════════════════════╗
+║        CERBERUS WASTEWATCHER — INDUSTRY EDITION          ║
+║  • Person Detection          (GREEN)                     ║
+║  • Garbage / Litter          (YELLOW)                    ║
+║  • Bag / Backpack / Suitcase (ORANGE)                    ║
+║  • Person Carrying Garbage   (RED)                       ║
+║  • Litter Drop Alert         (MAGENTA)                   ║
+║  Version: 10.0.0  |  Tracker: IoU  |  Model: YOLOv8s     ║ 
+╚══════════════════════════════════════════════════════════╝
+""")
+
+# ─────────────────────────────────────────────────────────────────────────────
+# CONFIG
+# ─────────────────────────────────────────────────────────────────────────────
+class Config:
+    CAMERA_ID    = 0
+    FRAME_WIDTH  = 1280
+    FRAME_HEIGHT = 720
+    MODEL_PATH   = 'yolov8s.pt'       # upgraded from nano → small
+    CONFIDENCE   = 0.35
+    IOU_THRESH   = 0.45
+
+    # ── COCO class IDs that we treat as GARBAGE/LITTER ───────────────────────
+    # (string matching was broken — COCO has no class named 'trash'/'garbage')
+    GARBAGE_IDS = {
+        39,   # bottle
+        40,   # wine glass
+        41,   # cup
+        42,   # fork
+        43,   # knife
+        44,   # spoon
+        45,   # bowl
+        67,   # cell phone  (commonly littered)
+        73,   # book
+        74,   # clock
+        75,   # vase
+        76,   # scissors
+        77,   # teddy bear
+        79,   # toothbrush
+    }
+
+    # ── COCO class IDs that are bag-type (orange) ────────────────────────────
+    BAG_IDS = {
+        24,   # backpack
+        26,   # handbag
+        28,   # suitcase
+    }
+
+    # ── COCO class ID for person ─────────────────────────────────────────────
+    PERSON_ID = 0
+
+    # ── Tracking & carry thresholds ──────────────────────────────────────────
+    TRACK_IOU_THRESH     = 0.30   # min IoU to match detection to existing track
+    CARRY_FRAME_THRESH   = 15     # frames item must be near person → CARRYING
+    DROP_DISTANCE_PX     = 100    # px — how far item must be from person to drop
+    CARRY_PROXIMITY_PX   = 200    # px — center-to-center for carry detection
+    LITTER_LINGER_FRAMES = 45     # frames a stationary item lingers after person leaves
+
+    # ── Directories ──────────────────────────────────────────────────────────
+    BASE_DIR  = "Cerberus_Data"
+    IMAGE_DIR = f"{BASE_DIR}/events"
+    LOG_DIR   = f"{BASE_DIR}/logs"
+    FACE_DIR  = f"{BASE_DIR}/faces"
+
+    # ── Colors (BGR) ─────────────────────────────────────────────────────────
+    C_PERSON   = (  0, 220,   0)   # green
+    C_CARRYING = (  0,   0, 220)   # red
+    C_GARBAGE  = (  0, 220, 220)   # yellow
+    C_BAG      = (  0, 165, 255)   # orange
+    C_LITTER   = (200,   0, 200)   # magenta  (dropped litter alert)
+    C_FACE     = (220,   0,   0)   # blue
+    C_HUD_BG   = (  0,   0,   0)
+    C_GOLD     = (  0, 215, 255)
+
+    @staticmethod
+    def create_dirs():
+        for d in [Config.IMAGE_DIR, Config.LOG_DIR, Config.FACE_DIR]:
+            Path(d).mkdir(parents=True, exist_ok=True)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# IoU UTILITY
+# ─────────────────────────────────────────────────────────────────────────────
+def iou(boxA, boxB):
+    """Compute IoU between two [x1,y1,x2,y2] boxes."""
+    xA = max(boxA[0], boxB[0]); yA = max(boxA[1], boxB[1])
+    xB = min(boxA[2], boxB[2]); yB = min(boxA[3], boxB[3])
+    interW = max(0, xB - xA); interH = max(0, yB - yA)
+    inter  = interW * interH
+    if inter == 0:
+        return 0.0
+    areaA = (boxA[2]-boxA[0]) * (boxA[3]-boxA[1])
+    areaB = (boxB[2]-boxB[0]) * (boxB[3]-boxB[1])
+    return inter / float(areaA + areaB - inter)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# SIMPLE IoU TRACKER
+# Assigns stable integer IDs to detections across frames.
+# ─────────────────────────────────────────────────────────────────────────────
+class SimpleTracker:
+    def __init__(self, max_lost: int = 30):
+        self._next_id  = 0
+        self._tracks   = {}   # id → {bbox, lost, cls, conf, center}
+        self._max_lost = max_lost
+
+    def update(self, detections: list) -> list:
+        """
+        detections: list of dicts with keys bbox, cls, conf, center, area
+        Returns: same list enriched with 'track_id'
+        """
+        # ── age all tracks ────────────────────────────────────────────────────
+        for tid in self._tracks:
+            self._tracks[tid]['lost'] += 1
+
+        matched_track_ids = set()
+        output = []
+
+        for det in detections:
+            best_iou  = Config.TRACK_IOU_THRESH
+            best_tid  = None
+
+            for tid, tr in self._tracks.items():
+                if tr['cls'] != det['cls']:
+                    continue
+                sc = iou(det['bbox'], tr['bbox'])
+                if sc > best_iou:
+                    best_iou = sc
+                    best_tid = tid
+
+            if best_tid is not None:
+                self._tracks[best_tid].update({
+                    'bbox'  : det['bbox'],
+                    'conf'  : det['conf'],
+                    'center': det['center'],
+                    'area'  : det['area'],
+                    'lost'  : 0,
+                })
+                matched_track_ids.add(best_tid)
+                det['track_id'] = best_tid
+            else:
+                # new track
+                tid = self._next_id; self._next_id += 1
+                self._tracks[tid] = {
+                    'bbox'  : det['bbox'],
+                    'cls'   : det['cls'],
+                    'conf'  : det['conf'],
+                    'center': det['center'],
+                    'area'  : det['area'],
+                    'lost'  : 0,
+                }
+                det['track_id'] = tid
+
+            output.append(det)
+
+        # ── prune dead tracks ─────────────────────────────────────────────────
+        dead = [tid for tid, tr in self._tracks.items() if tr['lost'] > self._max_lost]
+        for tid in dead:
+            del self._tracks[tid]
+
+        return output
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# FACE DETECTOR (Haar — lightweight, no extra model download)
+# ─────────────────────────────────────────────────────────────────────────────
+class FaceDetector:
+    def __init__(self):
+        self._cascade = None
+        try:
+            path = cv2.data.haarcascades + 'haarcascade_frontalface_default.xml'
+            if os.path.exists(path):
+                c = cv2.CascadeClassifier(path)
+                if not c.empty():
+                    self._cascade = c
+                    print("  [OK] Face detector loaded (Haar)")
+        except Exception as e:
+            print(f"  [WARN] Face detector: {e}")
+
+    def detect(self, roi):
+        if self._cascade is None or roi is None or roi.size == 0:
+            return []
+        gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
+        gray = cv2.equalizeHist(gray)
+        faces = self._cascade.detectMultiScale(
+            gray, scaleFactor=1.05, minNeighbors=5,
+            minSize=(25, 25), maxSize=(300, 300)
+        )
+        return faces if len(faces) > 0 else []
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# GARBAGE DETECTOR — wraps YOLO + Tracker
+# ─────────────────────────────────────────────────────────────────────────────
+class GarbageDetector:
+    def __init__(self):
+        print("[LOAD] Loading YOLOv8s model …")
+        self.model = YOLO(Config.MODEL_PATH)
+        print(f"  [OK] Model loaded: {Config.MODEL_PATH}")
+
+        self.person_tracker  = SimpleTracker(max_lost=30)
+        self.garbage_tracker = SimpleTracker(max_lost=30)
+
+    # ── raw YOLO inference ─────────────────────────────────────────────────
+    def _infer(self, frame):
+        return self.model(
+            frame,
+            conf=Config.CONFIDENCE,
+            iou=Config.IOU_THRESH,
+            verbose=False
+        )
+
+    # ── build det dict ─────────────────────────────────────────────────────
+    @staticmethod
+    def _make_det(name, cls_id, conf, x1, y1, x2, y2):
+        cx = int((x1 + x2) / 2); cy = int((y1 + y2) / 2)
+        return {
+            'class' : name,
+            'cls'   : cls_id,
+            'conf'  : conf,
+            'bbox'  : (int(x1), int(y1), int(x2), int(y2)),
+            'center': (cx, cy),
+            'area'  : (x2 - x1) * (y2 - y1),
+        }
+
+    # ── detect & track ─────────────────────────────────────────────────────
+    def detect(self, frame):
+        """
+        Returns:
+            persons  — tracked list of person dicts
+            garbage  — tracked list of garbage/litter dicts
+            bags     — subset of garbage that are bag-type
+        """
+        raw_persons = []
+        raw_garbage = []
+        raw_bags    = []
+
+        results = self._infer(frame)
+        for r in results:
+            if r.boxes is None:
+                continue
+            for box in r.boxes:
+                cls_id = int(box.cls[0])
+                conf   = float(box.conf[0])
+                x1, y1, x2, y2 = box.xyxy[0].cpu().numpy().tolist()
+                name   = self.model.names[cls_id]
+                det    = self._make_det(name, cls_id, conf, x1, y1, x2, y2)
+
+                if cls_id == Config.PERSON_ID:
+                    w = x2 - x1; h = y2 - y1
+                    aspect = h / w if w > 0 else 0
+                    area   = w * h
+                    # FIX: correct aspect ratio — standing person H/W ≈ 2–3
+                    if aspect > 1.3 and 500 < area < 250_000:
+                        raw_persons.append(det)
+
+                elif cls_id in Config.BAG_IDS:
+                    det['is_bag'] = True
+                    raw_bags.append(det)
+                    raw_garbage.append(det)
+
+                elif cls_id in Config.GARBAGE_IDS:
+                    det['is_bag'] = False
+                    raw_garbage.append(det)
+
+        persons = self.person_tracker.update(raw_persons)
+        garbage = self.garbage_tracker.update(raw_garbage)
+        bags    = [g for g in garbage if g.get('is_bag')]
+
+        return persons, garbage, bags
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# CARRY TRACKER — temporal logic: must be near person for N frames
+# ─────────────────────────────────────────────────────────────────────────────
+class CarryTracker:
+    """
+    Tracks how many consecutive frames a (person_id, garbage_id) pair
+    have been within CARRY_PROXIMITY_PX of each other.
+    When frame count ≥ CARRY_FRAME_THRESH → declare CARRYING.
+    """
+    def __init__(self):
+        self._counters = defaultdict(int)   # (pid, gid) → frame count
+        self._active   = set()              # confirmed carrying pairs
+
+    def update(self, persons, garbage):
+        """Returns list of confirmed carrying dicts."""
+        current_pairs = set()
+
+        for p in persons:
+            pid = p['track_id']
+            px, py = p['center']
+            for g in garbage:
+                gid = g['track_id']
+                gx, gy = g['center']
+                dist = ((px-gx)**2 + (py-gy)**2) ** 0.5
+                if dist < Config.CARRY_PROXIMITY_PX:
+                    # Also check item is in upper-body region (not just standing on it)
+                    px1, py1, px2, py2 = p['bbox']
+                    lower_bound = py1 + (py2 - py1) * 0.75
+                    if gy < lower_bound:
+                        current_pairs.add((pid, gid))
+                        self._counters[(pid, gid)] += 1
+                    else:
+                        # item near feet — likely on ground
+                        self._counters[(pid, gid)] = max(0, self._counters[(pid, gid)] - 2)
+
+        # Decay pairs no longer close
+        for pair in list(self._counters):
+            if pair not in current_pairs:
+                self._counters[pair] = max(0, self._counters[pair] - 3)
+                if self._counters[pair] == 0:
+                    self._active.discard(pair)
+                    del self._counters[pair]
+
+        # Confirm new carrying pairs
+        for pair, count in self._counters.items():
+            if count >= Config.CARRY_FRAME_THRESH:
+                self._active.add(pair)
+
+        # Build result
+        result = []
+        pid_map = {p['track_id']: p for p in persons}
+        gid_map = {g['track_id']: g for g in garbage}
+        seen = set()
+        for (pid, gid) in self._active:
+            if pid in pid_map and gid in gid_map and (pid, gid) not in seen:
+                seen.add((pid, gid))
+                g = gid_map[gid]
+                result.append({
+                    'person'    : pid_map[pid],
+                    'garbage'   : g,
+                    'confidence': min(1.0, self._counters.get((pid,gid),0) / Config.CARRY_FRAME_THRESH),
+                    'is_bag'    : g.get('is_bag', False),
+                })
+        return result
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# LITTER DROP TRACKER
+# Detects when a garbage item appears (or stays) in a location after a
+# person who was carrying it has moved away.
+# ─────────────────────────────────────────────────────────────────────────────
+class LitterDropTracker:
+    def __init__(self):
+        self._litter   = {}   # gid → {center, frames_alone}
+        self.confirmed = set()
+
+    def update(self, garbage, carrying):
+        carried_gids = {c['garbage']['track_id'] for c in carrying}
+
+        for g in garbage:
+            gid = g['track_id']
+            if gid in carried_gids:
+                # being carried — reset linger counter
+                if gid in self._litter:
+                    del self._litter[gid]
+                self.confirmed.discard(gid)
+            else:
+                if gid not in self._litter:
+                    self._litter[gid] = {'center': g['center'], 'frames': 0, 'det': g}
+                else:
+                    self._litter[gid]['frames'] += 1
+                    self._litter[gid]['det'] = g
+                    if self._litter[gid]['frames'] >= Config.LITTER_LINGER_FRAMES:
+                        self.confirmed.add(gid)
+
+        # prune gids no longer in garbage
+        live_gids = {g['track_id'] for g in garbage}
+        for gid in list(self._litter):
+            if gid not in live_gids:
+                del self._litter[gid]
+                self.confirmed.discard(gid)
+
+    def get_confirmed(self, garbage):
+        return [g for g in garbage if g['track_id'] in self.confirmed]
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# CERBERUS DETECTOR — main orchestrator
+# ─────────────────────────────────────────────────────────────────────────────
+class CerberusDetector:
+    def __init__(self):
+        display_banner()
+        Config.create_dirs()
+
+        self.detector      = GarbageDetector()
+        self.face_det      = FaceDetector()
+        self.carry_tracker = CarryTracker()
+        self.litter_track  = LitterDropTracker()
+
+        self.drop_count    = 0
+        self.unique_ids    = set()
+        self.last_alert    = 0.0
+        self.frame_count   = 0
+        self.fps           = 0.0
+        self._fps_t        = time.time()
+        self._fps_buf      = deque(maxlen=60)
+
+        self._setup_log()
+
+        print("\n" + "═"*58)
+        print("  SYSTEM READY — Industry Detection Active")
+        print("  Controls: [q] Quit  [s] Snapshot  [r] Reset stats")
+        print("═"*58 + "\n")
+
+    # ── logging ───────────────────────────────────────────────────────────
+    def _setup_log(self):
+        ts = datetime.now().strftime('%Y%m%d_%H%M%S')
+        self.log_path = f"{Config.LOG_DIR}/log_{ts}.csv"
+        with open(self.log_path, 'w', newline='') as f:
+            w = csv.writer(f)
+            w.writerow(['Timestamp', 'Event', 'PersonID', 'GarbageClass',
+                        'GarbageConf', 'IsLitterDrop', 'ImagePath'])
+        print(f"[LOG] {self.log_path}")
+
+    def _log(self, person_id, garbage, image_path, is_drop=False):
+        try:
+            with open(self.log_path, 'a', newline='') as f:
+                w = csv.writer(f)
+                w.writerow([
+                    datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+                    'LITTER_DROP' if is_drop else 'CARRYING',
+                    person_id,
+                    garbage['class'],
+                    f"{garbage['conf']:.3f}",
+                    is_drop,
+                    image_path or '',
+                ])
+        except Exception:
+            pass
+
+    # ── face capture ──────────────────────────────────────────────────────
+    def _capture_face(self, frame, bbox):
+        try:
+            x1, y1, x2, y2 = bbox
+            pad = 30
+            roi = frame[max(0,y1-pad):min(frame.shape[0],y2+pad),
+                        max(0,x1-pad):min(frame.shape[1],x2+pad)]
+            faces = self.face_det.detect(roi)
+            if len(faces):
+                fx, fy, fw, fh = max(faces, key=lambda f: f[2]*f[3])
+                face = roi[fy:fy+fh, fx:fx+fw]
+                if face.size:
+                    face = cv2.resize(face, (112, 112))
+                    ts   = datetime.now().strftime('%Y%m%d_%H%M%S_%f')[:-3]
+                    path = f"{Config.FACE_DIR}/face_{ts}.jpg"
+                    cv2.imwrite(path, face)
+                    return path
+        except Exception:
+            pass
+        return None
+
+    # ── save event image ──────────────────────────────────────────────────
+    def _save_event(self, frame, person, garbage, is_drop=False):
+        try:
+            ts   = datetime.now().strftime('%Y%m%d_%H%M%S_%f')[:-3]
+            path = f"{Config.IMAGE_DIR}/event_{ts}.jpg"
+            img  = frame.copy()
+            x1, y1, x2, y2 = person['bbox']
+            cv2.rectangle(img, (x1,y1),(x2,y2), Config.C_CARRYING, 3)
+            label = "LITTER DROP!" if is_drop else "CARRYING GARBAGE"
+            cv2.putText(img, label, (x1, y1-12),
+                        cv2.FONT_HERSHEY_DUPLEX, 0.65, Config.C_CARRYING, 2)
+            gx1,gy1,gx2,gy2 = garbage['bbox']
+            gc = Config.C_LITTER if is_drop else (Config.C_BAG if garbage.get('is_bag') else Config.C_GARBAGE)
+            cv2.rectangle(img,(gx1,gy1),(gx2,gy2), gc, 3)
+            cv2.line(img, person['center'], garbage['center'], Config.C_CARRYING, 2)
+            cv2.putText(img, f"#{self.drop_count} | {datetime.now().strftime('%H:%M:%S')}",
+                        (12, 32), cv2.FONT_HERSHEY_DUPLEX, 0.7, Config.C_GOLD, 2)
+            cv2.imwrite(path, img)
+            return path
+        except Exception as e:
+            print(f"  [WARN] save_event: {e}")
+            return None
+
+    # ── alert ─────────────────────────────────────────────────────────────
+    def _alert(self, frame, person, garbage, is_drop=False):
+        now = time.time()
+        if now - self.last_alert < 3.0:
+            return
+        self.last_alert = now
+        self.drop_count += 1
+
+        pid        = person['track_id']
+        self.unique_ids.add(pid)
+
+        face_path  = self._capture_face(frame, person['bbox'])
+        img_path   = self._save_event(frame, person, garbage, is_drop)
+        self._log(pid, garbage, img_path, is_drop)
+
+        tag = "LITTER DROP" if is_drop else "CARRYING GARBAGE"
+        print(f"\n{'!'*55}")
+        print(f"  ⚠  ALERT — {tag}")
+        print(f"  Event #{self.drop_count}  |  Person ID: {pid}")
+        print(f"  Time   : {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+        print(f"  Item   : {garbage['class']}  (conf {garbage['conf']:.2f})")
+        if face_path:
+            print(f"  Face   : {os.path.basename(face_path)}")
+        if img_path:
+            print(f"  Saved  : {os.path.basename(img_path)}")
+        print(f"{'!'*55}\n")
+
+    # ── draw ──────────────────────────────────────────────────────────────
+    def _draw(self, frame, persons, garbage, bags, carrying, litter_dropped):
+        img = frame.copy()
+        carrying_person_ids  = {c['person']['track_id'] for c in carrying}
+        carrying_garbage_ids = {c['garbage']['track_id'] for c in carrying}
+        litter_ids           = {g['track_id'] for g in litter_dropped}
+
+        # ── garbage / bags ─────────────────────────────────────────────────
+        for g in garbage:
+            x1,y1,x2,y2 = g['bbox']
+            gid = g['track_id']
+            if gid in litter_ids:
+                color = Config.C_LITTER
+                label = f"LITTER! {g['class']}"
+            elif g.get('is_bag'):
+                color = Config.C_BAG
+                label = f"BAG:{g['class']} {g['conf']:.2f}"
+            else:
+                color = Config.C_GARBAGE
+                label = f"{g['class']} {g['conf']:.2f}"
+            cv2.rectangle(img,(x1,y1),(x2,y2),color,2)
+            self._label(img, label, x1, y1-8, color)
+
+        # ── persons ────────────────────────────────────────────────────────
+        for p in persons:
+            x1,y1,x2,y2 = p['bbox']
+            pid = p['track_id']
+            if pid in carrying_person_ids:
+                color = Config.C_CARRYING
+                label = f"ID:{pid} CARRYING"
+            else:
+                color = Config.C_PERSON
+                label = f"ID:{pid} PERSON {p['conf']:.2f}"
+            cv2.rectangle(img,(x1,y1),(x2,y2),color,2)
+            self._label(img, label, x1, y1-10, color)
+
+        # ── carry links ────────────────────────────────────────────────────
+        for c in carrying:
+            pc = c['person']['center']
+            gc = c['garbage']['center']
+            cv2.line(img, pc, gc, Config.C_CARRYING, 2)
+            mid = ((pc[0]+gc[0])//2, (pc[1]+gc[1])//2)
+            cv2.putText(img, f"conf:{c['confidence']:.2f}", mid,
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.45, Config.C_CARRYING, 1)
+
+        self._draw_hud(img, persons, carrying, litter_dropped)
+        return img
+
+    @staticmethod
+    def _label(img, text, x, y, color, scale=0.5, thick=1):
+        (tw, th), _ = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, scale, thick)
+        cv2.rectangle(img,(x, y-th-4),(x+tw+4, y+2),(0,0,0),-1)
+        cv2.putText(img, text,(x+2, y), cv2.FONT_HERSHEY_SIMPLEX, scale, color, thick)
+
+    def _draw_hud(self, frame, persons, carrying, litter):
+        h, w = frame.shape[:2]
+        overlay = frame.copy()
+        cv2.rectangle(overlay,(8,8),(310,195),(0,0,0),-1)
+        cv2.addWeighted(overlay, 0.65, frame, 0.35, 0, frame)
+        cv2.rectangle(frame,(8,8),(310,195),Config.C_GOLD,1)
+
+        def put(txt, y, color=(255,255,255), scale=0.48):
+            cv2.putText(frame, txt,(18,y), cv2.FONT_HERSHEY_SIMPLEX, scale, color, 1)
+
+        put("CERBERUS WASTEWATCHER", 30, Config.C_GOLD, 0.52)
+        put(f"FPS: {self.fps:4.1f}", 55)
+        put(f"Persons  : {len(persons)}", 78)
+        put(f"Carrying : {len(carrying)}", 100, Config.C_CARRYING if carrying else (255,255,255))
+        put(f"Litter   : {len(litter)}", 122, Config.C_LITTER if litter else (255,255,255))
+        put(f"Alerts   : {self.drop_count}", 144, Config.C_GOLD)
+        put(f"Unique IDs: {len(self.unique_ids)}", 167)
+
+        status = "⚠ ALERT" if (carrying or litter) else "● MONITORING"
+        sc = Config.C_CARRYING if (carrying or litter) else Config.C_PERSON
+        put(status, 190, sc, 0.5)
+
+        # legend bottom-left
+        lx, ly = 10, h-130
+        overlay2 = frame.copy()
+        cv2.rectangle(overlay2,(lx,ly),(lx+215,ly+125),(0,0,0),-1)
+        cv2.addWeighted(overlay2, 0.60, frame, 0.40, 0, frame)
+        items = [
+            (Config.C_PERSON,   "Person (normal)"),
+            (Config.C_CARRYING, "Person carrying"),
+            (Config.C_GARBAGE,  "Garbage/litter"),
+            (Config.C_BAG,      "Bag/Backpack"),
+            (Config.C_LITTER,   "Dropped litter"),
+        ]
+        cv2.putText(frame,"LEGEND",(lx+8,ly+18),cv2.FONT_HERSHEY_SIMPLEX,0.45,(255,255,255),1)
+        for i,(col,lab) in enumerate(items):
+            iy = ly+38+i*18
+            cv2.rectangle(frame,(lx+8,iy-10),(lx+26,iy+2),col,-1)
+            cv2.putText(frame,lab,(lx+32,iy),cv2.FONT_HERSHEY_SIMPLEX,0.38,(220,220,220),1)
+
+    # ── FPS calculation ───────────────────────────────────────────────────
+    def _tick_fps(self):
+        now = time.time()
+        self._fps_buf.append(now)
+        if len(self._fps_buf) > 1:
+            self.fps = (len(self._fps_buf)-1) / (self._fps_buf[-1] - self._fps_buf[0])
+
+    # ── main frame processor ──────────────────────────────────────────────
+    def process(self, frame):
+        persons, garbage, bags = self.detector.detect(frame)
+        carrying  = self.carry_tracker.update(persons, garbage)
+        self.litter_track.update(garbage, carrying)
+        litter    = self.litter_track.get_confirmed(garbage)
+
+        # fire alerts
+        for c in carrying:
+            self._alert(frame, c['person'], c['garbage'], is_drop=False)
+        for g in litter:
+            # find nearest person as "responsible" — use closest person
+            best_p = None
+            best_d = float('inf')
+            for p in persons:
+                d = ((p['center'][0]-g['center'][0])**2 +
+                     (p['center'][1]-g['center'][1])**2) ** 0.5
+                if d < best_d:
+                    best_d = d; best_p = p
+            if best_p is None and persons:
+                best_p = persons[0]
+            if best_p:
+                self._alert(frame, best_p, g, is_drop=True)
+
+        annotated = self._draw(frame, persons, garbage, bags, carrying, litter)
+        self._tick_fps()
+        return annotated
+
+    # ── run loop ──────────────────────────────────────────────────────────
+    def run(self, source=None):
+        src = Config.CAMERA_ID if source is None else source
+        cap = cv2.VideoCapture(src)
+        if not cap.isOpened():
+            print(f"[ERROR] Cannot open source: {src}")
+            return
+
+        cap.set(cv2.CAP_PROP_FRAME_WIDTH,  Config.FRAME_WIDTH)
+        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, Config.FRAME_HEIGHT)
+        cap.set(cv2.CAP_PROP_BUFFERSIZE,   1)
+        print(f"[OK] Source opened ({int(cap.get(3))}×{int(cap.get(4))})\n")
+
+        while True:
+            ret, frame = cap.read()
+            if not ret:
+                print("[INFO] Stream ended.")
+                break
+            self.frame_count += 1
+
+            annotated = self.process(frame)
+            cv2.imshow('Cerberus WasteWatcher — Industry Edition', annotated)
+
+            key = cv2.waitKey(1) & 0xFF
+            if key == ord('q'):
+                break
+            elif key == ord('s'):
+                ts   = datetime.now().strftime('%Y%m%d_%H%M%S')
+                path = f"{Config.IMAGE_DIR}/snap_{ts}.jpg"
+                cv2.imwrite(path, annotated)
+                print(f"[SNAP] {path}")
+            elif key == ord('r'):
+                self.drop_count = 0
+                self.unique_ids.clear()
+                print("[RESET] Stats cleared")
+
+        cap.release()
+        cv2.destroyAllWindows()
+        print(f"\n{'═'*55}")
+        print("  FINAL REPORT")
+        print(f"  Alerts logged : {self.drop_count}")
+        print(f"  Unique IDs    : {len(self.unique_ids)}")
+        print(f"  Log file      : {self.log_path}")
+        print(f"{'═'*55}\n")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# ENTRY POINT
+# ─────────────────────────────────────────────────────────────────────────────
+def main():
+    p = argparse.ArgumentParser(description='Cerberus WasteWatcher — Industry Edition')
+    p.add_argument('--camera',  type=int,   default=0,     help='Camera device ID (default 0)')
+    p.add_argument('--source',  type=str,   default=None,  help='Video file or RTSP URL (overrides --camera)')
+    p.add_argument('--width',   type=int,   default=1280,  help='Frame width')
+    p.add_argument('--height',  type=int,   default=720,   help='Frame height')
+    p.add_argument('--conf',    type=float, default=0.35,  help='Detection confidence threshold')
+    p.add_argument('--model',   type=str,   default='yolov8s.pt', help='YOLO model path/name')
+    args = p.parse_args()
+
+    Config.CAMERA_ID    = args.camera
+    Config.FRAME_WIDTH  = args.width
+    Config.FRAME_HEIGHT = args.height
+    Config.CONFIDENCE   = args.conf
+    Config.MODEL_PATH   = args.model
+
+    try:
+        det = CerberusDetector()
+        det.run(source=args.source)
+    except KeyboardInterrupt:
+        print("\n[INFO] Interrupted by user.")
+    except Exception as e:
+        import traceback
+        print(f"\n[ERROR] {e}")
+        traceback.print_exc()
+
+
+if __name__ == '__main__':
+    main()
+
+#!/usr/bin/env python3
+"""
 Cerberus WasteWatcher - Ultimate Full Version
 Complete Garbage Detection System with ALL Features
 Version: 6.0.0 - The Final Version
