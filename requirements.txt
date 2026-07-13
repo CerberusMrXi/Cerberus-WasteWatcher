@@ -1,66 +1,30 @@
-# ============================================
-# Cerberus WasteWatcher - Requirements
-# Three-Headed Garbage Detection System
-# Version: 2.0.0
-# ============================================
+# ============================================================
+# Cerberus WasteWatcher — Requirements (Industry Edition)
+# Version: 1.0.0
+# Install: pip install -r requirements.txt
+# ============================================================
 
-# Core Computer Vision & Deep Learning
-opencv-python==4.8.1.78
-opencv-contrib-python==4.8.1.78
-ultralytics==8.0.200
-torch==2.1.0
-torchvision==0.16.0
+# Core Computer Vision
+opencv-python>=4.8.0
+opencv-contrib-python>=4.8.0
 
-# Numerical & Scientific Computing
-numpy==1.24.3
-scipy==1.11.4
-pandas==2.1.3
+# YOLO / Deep Learning
+ultralytics>=8.0.200
+torch>=2.1.0
+torchvision>=0.16.0
 
-# Image Processing
-Pillow==10.1.0
-imutils==0.5.4
+# Numerical
+numpy>=1.24.0
+scipy>=1.11.0
 
-# Machine Learning Utilities
-scikit-learn==1.3.2
-matplotlib==3.8.2
-seaborn==0.13.0
+# Image utilities
+Pillow>=10.0.0
 
-# System & File Handling
-pathlib==1.0.1
-shutil==1.0.0
-hashlib==1.0.0
-json==2.0.9
-csv==1.0.0
+# Optional — GPU acceleration
+# Uncomment the correct line for your CUDA version:
+# cupy-cuda11x>=12.0.0   # CUDA 11.x
+# cupy-cuda12x>=12.0.0   # CUDA 12.x
 
-# Async & Threading
-threading==1.0.0
-queue==1.0.0
-
-# Date & Time
-datetime==5.4
-
-# Web/API (Optional - for remote monitoring)
-flask==3.0.0
-flask-cors==4.0.0
-requests==2.31.0
-
-# Database (Optional - for larger deployments)
-sqlalchemy==2.0.23
-sqlite3==1.0.0
-
-# Notification (Optional)
-smtplib==1.0.0
-twilio==8.5.0
-
-# Logging & Monitoring
-logging==0.5.1.2
-tqdm==4.66.1
-
-# GPU Acceleration (Optional - remove if no GPU)
-# cupy-cuda11x==12.3.0  # Uncomment for CUDA 11.x
-# cupy-cuda12x==12.3.0  # Uncomment for CUDA 12.x
-
-# ============================================
-# Installation Command:
-# pip install -r requirements.txt
-# ============================================
+# Optional — Flask web dashboard (future feature)
+# flask>=3.0.0
+# flask-cors>=4.0.0
